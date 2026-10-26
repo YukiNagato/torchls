@@ -2,6 +2,7 @@
 
 from .cost import Cost
 from .geometry import SE2Var, SE3Var, se3_exp, so3_exp
+from .losses import HuberLoss, Loss
 from .named import Problem
 from .problem import AnalyzedLeastSquaresProblem, LeastSquaresProblem, Linearization
 from .solvers import (
@@ -21,8 +22,10 @@ __all__ = [
     "BlockJacobian",
     "ConjugateGradientConfig",
     "Cost",
+    "HuberLoss",
     "LeastSquaresProblem",
     "Linearization",
+    "Loss",
     "PCGResult",
     "Problem",
     "SE2Var",

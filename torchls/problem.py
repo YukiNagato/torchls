@@ -17,12 +17,22 @@ def _is_reference(arg):
 
 @dataclass(frozen=True)
 class Linearization:
+    """Residual and Jacobian of the local solve model, plus the true objective.
+
+    With a loss, ``raw_residual`` holds the original errors and ``cost`` is
+    the robust objective, not half the squared norm of the model residual.
+    """
+
     residual: Tensor
     jacobian: BlockJacobian
+    raw_residual: Tensor | None = None
+    objective: Tensor | None = None
 
     @property
     def cost(self) -> Tensor:
-        """Objective convention: 0.5 * sum(residual ** 2)."""
+        """True objective, including each residual block's declared loss."""
+        if self.objective is not None:
+            return self.objective
         return 0.5 * self.residual.to(torch.float64).square().sum()
 
     @property
@@ -142,6 +152,7 @@ class AnalyzedLeastSquaresProblem:
         self.layout = layout
         self.tangent_dim = tangent_dim
         self._plans = tuple(_CostPlan(cost, layout) for cost in costs)
+        self._has_loss = any(plan.cost.loss is not None for plan in self._plans)
 
     def _validate_values(self, vals):
         if set(vals._values) != {entry.key for entry in self.layout}:
@@ -164,6 +175,7 @@ class AnalyzedLeastSquaresProblem:
         return VarValues.make(entry.var_type(entry.ids) for entry in self.layout)
 
     def residuals(self, vals: VarValues) -> Tensor:
+        """Return raw residuals, without robust weights or loss transforms."""
         self._validate_values(vals)
         residuals = []
         for plan in self._plans:
@@ -175,11 +187,52 @@ class AnalyzedLeastSquaresProblem:
         return torch.cat(residuals)
 
     def cost(self, vals: VarValues) -> Tensor:
-        return 0.5 * self.residuals(vals).to(torch.float64).square().sum()
+        if not self._has_loss:
+            return 0.5 * self.residuals(vals).to(torch.float64).square().sum()
+        self._validate_values(vals)
+        values = []
+        for plan in self._plans:
+            args, _, _ = plan.gather(vals, self.layout)
+            residual = torch.func.vmap(plan.cost.residual_fn, chunk_size=plan.cost.batch_size)(
+                *args
+            ).reshape(plan.count, -1)
+            squared = residual.to(torch.float64).square().sum(dim=-1)
+            loss = plan.cost.loss
+            values.append((squared if loss is None else loss.value(squared)).sum())
+        return 0.5 * torch.stack(values).sum()
+
+    def _evaluate_trial(self, vals, linearization):
+        proposed = self.residuals(vals).to(torch.float64)
+        if not self._has_loss:
+            before = linearization.residual.to(torch.float64)
+            return (
+                0.5 * proposed.square().sum(),
+                0.5 * torch.dot(before - proposed, before + proposed),
+            )
+        before = linearization.raw_residual.to(torch.float64)
+        objectives, reductions = [], []
+        offset = 0
+        for plan, group in zip(self._plans, linearization.jacobian.groups, strict=True):
+            count, rows, _ = group.blocks[0].shape
+            old = before[offset : offset + count * rows].reshape(count, rows)
+            new = proposed[offset : offset + count * rows].reshape(count, rows)
+            offset += count * rows
+            old_squared, new_squared = old.square().sum(-1), new.square().sum(-1)
+            difference = ((old - new) * (old + new)).sum(-1)
+            loss = plan.cost.loss
+            objectives.append((new_squared if loss is None else loss.value(new_squared)).sum())
+            reductions.append(
+                (
+                    difference
+                    if loss is None
+                    else loss._reduction(old_squared, new_squared, difference)
+                ).sum()
+            )
+        return 0.5 * torch.stack(objectives).sum(), 0.5 * torch.stack(reductions).sum()
 
     def linearize(self, vals: VarValues) -> Linearization:
         self._validate_values(vals)
-        groups, residuals = [], []
+        groups, residuals, raw_residuals, objectives = [], [], [], []
         for plan in self._plans:
             args, indices, columns = plan.gather(vals, self.layout)
             cost = plan.cost
@@ -224,11 +277,25 @@ class AnalyzedLeastSquaresProblem:
             for block, key in zip(blocks, types, strict=True):
                 if block.shape != (plan.count, residual.shape[1], key.tangent_dim):
                     raise ValueError("Incorrect local Jacobian shape")
+            if self._has_loss:
+                raw_residuals.append(residual.reshape(-1))
+                squared = residual.to(torch.float64).square().sum(dim=-1)
+                if cost.loss is None:
+                    objectives.append(squared.sum())
+                else:
+                    evaluation = cost.loss.evaluate(squared)
+                    objectives.append(evaluation[0].sum())
+                    residual, blocks = cost.loss._linearize(residual, blocks, squared, evaluation)
             residuals.append(residual.reshape(-1))
             groups.append(JacobianGroup(tuple(blocks), columns, plan.type_indices, indices))
         residual = torch.cat(residuals)
         jacobian = BlockJacobian(tuple(groups), self.layout, (residual.numel(), self.tangent_dim))
-        return Linearization(residual, jacobian)
+        return Linearization(
+            residual,
+            jacobian,
+            torch.cat(raw_residuals) if self._has_loss else None,
+            0.5 * torch.stack(objectives).sum() if self._has_loss else None,
+        )
 
     def solve(self, initial_vals=None, **kwargs):
         from .solvers import solve

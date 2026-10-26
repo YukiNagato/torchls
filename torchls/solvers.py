@@ -411,17 +411,15 @@ def solve(
                     delta = solve_scale * delta
                 proposed = vals.retract(delta, problem.layout)
                 with region("trial_residual"):
-                    proposed_residual = problem.residuals(proposed)
-                proposed_cost = float(0.5 * proposed_residual.double().square().sum())
+                    objective, reduction = problem._evaluate_trial(proposed, linearization)
+                proposed_cost = float(objective)
                 predicted = float(
                     -torch.dot(gradient.double(), delta.double())
                     - 0.5 * original_jacobian.matvec(delta).double().square().sum()
                 )
-                # Expanded difference avoids subtracting two nearly equal
-                # objectives. Accumulate reductions in float64 even when the
-                # Jacobians and linear solve use float32.
-                old_r, new_r = residual.double(), proposed_residual.double()
-                actual = float(0.5 * torch.dot(old_r - new_r, old_r + new_r))
+                # Compare the true objective, not the robust model's squared
+                # residual. Expanded differences preserve small improvements.
+                actual = float(reduction)
                 quality = actual / predicted if predicted > 0 else -math.inf
                 accepted = math.isfinite(proposed_cost) and (
                     trust_region is None

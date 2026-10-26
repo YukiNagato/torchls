@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from .cost import Cost, JacMode
+from .losses import Loss
 from .problem import AnalyzedLeastSquaresProblem
 from .variables import (
     Var,
@@ -53,6 +54,7 @@ class Problem:
         batch_size: int | None = None,
         in_dims: tuple[int | None, ...] | None = None,
         jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None,
+        loss: Loss | None = None,
     ) -> Problem:
         """Add a batch using an ordinary, undecorated residual function.
 
@@ -60,6 +62,8 @@ class Problem:
         Other arguments are constant measurements/data. Index tensors define
         the batch; scalar indices broadcast. ``in_dims`` controls shared data
         exactly as in Cost. Indices are copied when the batch is added.
+        ``loss`` applies to each observation's complete residual block;
+        residual_fn and jacobian_fn return raw, unweighted values.
         """
         if not callable(residual_fn):
             raise TypeError("The first argument must be a residual function")
@@ -69,7 +73,9 @@ class Problem:
             else arg
             for arg in args
         )
-        self._costs.append(Cost(residual_fn, bound, jac_mode, batch_size, in_dims, jacobian_fn))
+        self._costs.append(
+            Cost(residual_fn, bound, jac_mode, batch_size, in_dims, jacobian_fn, loss)
+        )
         self._analyzed = None
         return self
 

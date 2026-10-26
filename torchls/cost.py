@@ -7,6 +7,8 @@ from typing import Literal
 
 from torch import Tensor
 
+from .losses import Loss
+
 JacMode = Literal["auto", "reverse", "forward"]
 
 
@@ -25,8 +27,11 @@ class Cost:
     batch_size: int | None = None
     in_dims: tuple[int | None, ...] | None = None
     jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None
+    loss: Loss | None = None
 
     def __post_init__(self):
+        if self.loss is not None and not isinstance(self.loss, Loss):
+            raise TypeError("loss must be a Loss instance such as HuberLoss, or None")
         if self.jac_mode not in ("auto", "reverse", "forward"):
             raise ValueError("jac_mode must be auto, reverse or forward")
         if self.batch_size is not None and self.batch_size <= 0:
@@ -42,6 +47,7 @@ class Cost:
 
         A custom jacobian_fn returns one (residual_dim, tangent_dim) matrix
         per Var argument, in argument order, using the same retractions.
+        It differentiates the raw residual; ``loss`` is applied afterward.
         """
 
         def decorate(residual_fn):
