@@ -7,6 +7,7 @@ from typing import Literal
 
 from torch import Tensor
 
+from .batching import AutoBatchSize, BatchSize
 from .losses import Loss
 
 JacMode = Literal["auto", "reverse", "forward"]
@@ -24,7 +25,7 @@ class Cost:
     residual_fn: Callable[..., Tensor]
     args: tuple
     jac_mode: JacMode = "auto"
-    batch_size: int | None = None
+    batch_size: BatchSize = None
     in_dims: tuple[int | None, ...] | None = None
     jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None
     loss: Loss | None = None
@@ -34,8 +35,13 @@ class Cost:
             raise TypeError("loss must be a Loss instance such as HuberLoss, or None")
         if self.jac_mode not in ("auto", "reverse", "forward"):
             raise ValueError("jac_mode must be auto, reverse or forward")
-        if self.batch_size is not None and self.batch_size <= 0:
-            raise ValueError("batch_size must be positive")
+        if self.batch_size is not None and not isinstance(self.batch_size, AutoBatchSize):
+            if (
+                isinstance(self.batch_size, bool)
+                or not isinstance(self.batch_size, int)
+                or self.batch_size <= 0
+            ):
+                raise ValueError("batch_size must be a positive integer, AutoBatchSize, or None")
         if self.in_dims is not None and (
             len(self.in_dims) != len(self.args) or any(x not in (0, None) for x in self.in_dims)
         ):

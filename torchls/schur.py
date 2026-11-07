@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import torch
 
+from .preconditioning import BlockJacobiPlan, cholesky_apply
 from .sparse import BlockJacobian, JacobianGroup
 from .variables import VariableLayout
 
 
 class SchurPlan:
-    def __init__(self, problem, eliminate, device):
+    def __init__(self, problem, eliminate, device, *, preconditioner_groups=()):
         matches = [i for i, entry in enumerate(problem.layout) if entry.key == eliminate]
         if len(matches) != 1:
             raise ValueError("eliminate must identify one parameter group by name or Var type")
@@ -143,10 +144,53 @@ class SchurPlan:
             ).to(device)
             for entry in self.layout
         )
+        self.joint_plan = (
+            BlockJacobiPlan(self.layout, preconditioner_groups, device)
+            if preconditioner_groups
+            else None
+        )
+        self.preconditioner_edges = []
+        if self.joint_plan is not None:
+            for block in self.joint_plan.blocks:
+                if len(block.members) == 1:
+                    self.preconditioner_edges.append(None)
+                    continue
+                keys = [self.edges[i][0] * self.e.count + self.edges[i][1] for i in block.members]
+                unique, inverse = torch.unique(torch.cat(keys), sorted=True, return_inverse=True)
+                maps = inverse.split([len(key) for key in keys])
+                self.preconditioner_edges.append((unique // self.e.count, maps))
+
+    def retained_normal_pattern(self):
+        """Cache block-pair aggregation, without expanding observation-wise scalar COO."""
+        if hasattr(self, "normal_indices"):
+            return self.normal_indices, self.normal_records
+        indices, records = [], []
+        for columns in self.block_columns:
+            rows, cols = torch.broadcast_tensors(columns[:, :, None], columns[:, None, :])
+            indices.append(torch.stack((rows.reshape(-1), cols.reshape(-1))))
+        for g, slot, other, columns, other_columns, mask in self.off_diagonal:
+            selected = mask.nonzero().flatten()
+            keys = columns[selected, 0] * self.dim + other_columns[selected, 0]
+            unique, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+            d, e = columns.shape[1], other_columns.shape[1]
+            rows = (
+                unique[:, None, None] // self.dim
+                + torch.arange(d, device=keys.device)[None, :, None]
+            )
+            cols = (
+                unique[:, None, None] % self.dim
+                + torch.arange(e, device=keys.device)[None, None, :]
+            )
+            rows, cols = torch.broadcast_tensors(rows, cols)
+            pair = torch.stack((rows.reshape(-1), cols.reshape(-1)))
+            indices.extend((pair, pair.flip(0)))
+            records.append((g, slot, other, selected, inverse, len(unique)))
+        self.normal_indices, self.normal_records = torch.cat(indices, dim=1), tuple(records)
+        return self.normal_indices, self.normal_records
 
 
 class SchurLinearization:
-    def __init__(self, jacobian, diagonal, plan, *, dense):
+    def __init__(self, jacobian, diagonal, plan, *, dense, cache_retained=False):
         self.plan, self.diagonal = plan, diagonal
         groups = tuple(
             JacobianGroup(
@@ -157,6 +201,13 @@ class SchurLinearization:
         self.retained_jacobian = (
             BlockJacobian(groups, plan.layout, (sum(g.num_rows for g in groups), plan.dim))
             if groups
+            else None
+        )
+        self.preconditioner_blocks = (
+            plan.joint_plan.normal_blocks(
+                self.retained_jacobian, tuple(diagonal[i] for i in plan.retained)
+            )
+            if plan.joint_plan is not None
             else None
         )
         self.cross = []
@@ -171,6 +222,23 @@ class SchurLinearization:
                     0, edge_ids, blocks[slot].transpose(-1, -2) @ eliminated_block
                 )
             self.cross.append(values)
+        self.retained_normal = None
+        if cache_retained and plan.off_diagonal:
+            indices, records = plan.retained_normal_pattern()
+            values = [diagonal[i].reshape(-1) for i in plan.retained]
+            for g, slot, other, selected, inverse, count in records:
+                blocks = jacobian.groups[g].blocks
+                cross = blocks[slot][selected].transpose(-1, -2) @ blocks[other][selected]
+                summed = cross.new_zeros(count, *cross.shape[1:]).index_add_(0, inverse, cross)
+                # Transposing the COO coordinates above already transposes this contribution.
+                values.extend((summed.reshape(-1), summed.reshape(-1)))
+            self.retained_normal = (
+                torch.sparse_coo_tensor(
+                    indices, torch.cat(values), size=(plan.dim, plan.dim), check_invariants=False
+                )
+                .coalesce()
+                .to_sparse_csr()
+            )
         self.base_matrix = None
         if dense:
             self.base_matrix = jacobian.groups[0].blocks[0].new_zeros(plan.dim, plan.dim)
@@ -234,7 +302,9 @@ class DampedSchurSystem:
 
     def matvec(self, vector):
         jac = self.linear.retained_jacobian
-        if not self.plan.off_diagonal:
+        if self.linear.retained_normal is not None:
+            base = self.linear.retained_normal @ vector + self.damping * vector
+        elif not self.plan.off_diagonal:
             base = (
                 torch.cat(
                     [
@@ -257,7 +327,29 @@ class DampedSchurSystem:
             )
         return base - self.w @ (self.wt @ vector)
 
-    def preconditioner(self):
+    def preconditioner(self, *, graph_safe=False):
+        if self.plan.joint_plan is not None:
+            diagonals = []
+            for block, base, edge_plan in zip(
+                self.plan.joint_plan.blocks,
+                self.linear.preconditioner_blocks,
+                self.plan.preconditioner_edges,
+                strict=True,
+            ):
+                if edge_plan is None:
+                    i = block.members[0]
+                    rows, _ = self.plan.edges[i]
+                    whitened = self.whitened[i]
+                else:
+                    rows, maps = edge_plan
+                    whitened = base.new_zeros(len(rows), block.dim, self.plan.e.dim)
+                    start = 0
+                    for i, mapping in zip(block.members, maps, strict=True):
+                        dim = self.plan.layout[i].dim
+                        whitened[:, start : start + dim].index_copy_(0, mapping, self.whitened[i])
+                        start += dim
+                diagonals.append(base.index_add(0, rows, -(whitened @ whitened.transpose(-1, -2))))
+            return self.plan.joint_plan.factor(diagonals, self.damping, graph_safe=graph_safe)
         factors = []
         for i, entry, block, (ri, _) in zip(
             self.plan.retained, self.plan.layout, self.whitened, self.plan.edges, strict=True
@@ -272,11 +364,12 @@ class DampedSchurSystem:
         def apply(vector):
             return torch.cat(
                 [
-                    torch.cholesky_solve(
+                    cholesky_apply(
                         vector[entry.offset : entry.offset + entry.count * entry.dim].reshape(
                             entry.count, entry.dim, 1
                         ),
                         factor,
+                        graph_safe=graph_safe,
                     ).reshape(-1)
                     for entry, factor in zip(self.plan.layout, factors, strict=True)
                 ]

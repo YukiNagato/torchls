@@ -27,6 +27,7 @@ class Var:
         default_factory: Callable[[], Tensor],
         tangent_dim: int | None = None,
         retract_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
+        retract_jvp_fn: Callable[[Tensor, Tensor], Tensor] | None = None,
         **kwargs,
     ):
         super().__init_subclass__(**kwargs)
@@ -35,12 +36,22 @@ class Var:
             raise TypeError("default_factory must return a floating point Tensor")
         if (tangent_dim is None) != (retract_fn is None):
             raise ValueError("Specify tangent_dim and retract_fn together")
+        if retract_jvp_fn is not None and retract_fn is None:
+            raise ValueError("retract_jvp_fn requires a manifold retract_fn")
+        if retract_jvp_fn is not None and not callable(retract_jvp_fn):
+            raise TypeError("retract_jvp_fn must be callable")
         cls.default_factory = staticmethod(default_factory)
+        cls.is_euclidean = retract_fn is None
         cls.tangent_dim = default.numel() if tangent_dim is None else tangent_dim
         if cls.tangent_dim <= 0:
             raise ValueError("tangent_dim must be positive")
         cls.retract_fn = staticmethod(
             (lambda x, delta: x + delta.reshape(x.shape)) if retract_fn is None else retract_fn
+        )
+        # Optional exact D_delta retract(value, 0)[direction], in storage shape.
+        # Never inherit this for a newly specified (possibly different) retraction.
+        cls.retract_jvp_fn = (
+            staticmethod(retract_jvp_fn) if retract_jvp_fn is not None else None
         )
 
     def __post_init__(self):
@@ -70,6 +81,8 @@ class _ParameterRef:
 
 @dataclass(frozen=True)
 class _EuclideanParameterization:
+    is_euclidean = True
+
     shape: tuple[int, ...]
 
     @property

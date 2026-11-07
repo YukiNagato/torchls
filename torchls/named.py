@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 import torch
 from torch import Tensor
 
+from .batching import BatchSize
 from .cost import Cost, JacMode
 from .losses import Loss
 from .problem import AnalyzedLeastSquaresProblem
@@ -51,7 +52,7 @@ class Problem:
         residual_fn: Callable[..., Tensor],
         *args,
         jac_mode: JacMode = "auto",
-        batch_size: int | None = None,
+        batch_size: BatchSize = None,
         in_dims: tuple[int | None, ...] | None = None,
         jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None,
         loss: Loss | None = None,
@@ -64,6 +65,7 @@ class Problem:
         exactly as in Cost. Indices are copied when the batch is added.
         ``loss`` applies to each observation's complete residual block;
         residual_fn and jacobian_fn return raw, unweighted values.
+        batch_size accepts a positive integer, AutoBatchSize, or None (unchunked).
         """
         if not callable(residual_fn):
             raise TypeError("The first argument must be a residual function")

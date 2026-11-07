@@ -10,6 +10,8 @@ from functools import partial
 import torch
 from torch import Tensor
 
+from .bounds import BoundsPlan
+from .preconditioning import BlockJacobiPlan, cholesky_apply, normalize_groups
 from .schur import SchurLinearization, SchurPlan
 from .sparse import BlockJacobian
 
@@ -20,12 +22,47 @@ class ConjugateGradientConfig:
     atol: float = 1e-10
     max_iterations: int = 200
     preconditioner: str | None = "block_jacobi"
+    preconditioner_groups: tuple[tuple, ...] = ()
+    residual_check_interval: int = 50
+    restart_strategy: str = "adaptive"
+    residual_drift_tolerance: float = 0.1
+    backend: str = "torch"
+    normal_matvec: str = "torch"
+    # Warp: graph replays between host status reads; GPU guards freeze stopped iterates.
+    graph_batch_iterations: int = 16
+    # Schur-CG: cache B = J_retained.T @ J_retained as sparse CSR per linearization.
+    cache_retained_matrix: bool = False
 
     def __post_init__(self):
+        if (
+            isinstance(self.graph_batch_iterations, bool)
+            or not isinstance(self.graph_batch_iterations, int)
+            or self.graph_batch_iterations < 1
+        ):
+            raise ValueError("graph_batch_iterations must be a positive integer")
+        if self.normal_matvec not in ("torch", "warp"):
+            raise ValueError("normal_matvec must be torch or warp")
+        if self.backend not in ("torch", "warp"):
+            raise ValueError("CG backend must be torch or warp")
         if self.rtol < 0 or self.atol < 0 or self.max_iterations < 1:
             raise ValueError("Invalid CG tolerance or iteration limit")
         if self.preconditioner not in ("block_jacobi", None):
             raise ValueError("preconditioner must be block_jacobi or None")
+        object.__setattr__(
+            self, "preconditioner_groups", normalize_groups(self.preconditioner_groups)
+        )
+        if self.preconditioner_groups and self.preconditioner is None:
+            raise ValueError("Joint groups require block_jacobi preconditioning")
+        if (
+            isinstance(self.residual_check_interval, bool)
+            or not isinstance(self.residual_check_interval, int)
+            or self.residual_check_interval < 0
+        ):
+            raise ValueError("residual_check_interval must be a nonnegative integer")
+        if self.restart_strategy not in ("adaptive", "periodic"):
+            raise ValueError("restart_strategy must be adaptive or periodic")
+        if not math.isfinite(self.residual_drift_tolerance) or self.residual_drift_tolerance <= 0:
+            raise ValueError("residual_drift_tolerance must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -91,6 +128,9 @@ class PCGResult:
     residual_norm: float
     converged: bool
     reason: str
+    restarts: int = 0
+    residual_checks: int = 0
+    rhs_norm: float = 0.0
 
 
 @dataclass
@@ -109,9 +149,13 @@ class SolveSummary:
     lambda_history: list[float] = field(default_factory=list)
     linear_iterations_history: list[int] = field(default_factory=list)
     linear_converged_history: list[bool] = field(default_factory=list)
+    trial_history: list[dict] = field(default_factory=list)
     linear_solver: str = "conjugate_gradient"
     jacobi_scaling: bool = False
     reduced_dim: int | None = None
+    linear_restarts: int = 0
+    linear_residual_checks: int = 0
+    linear_relative_residual_history: list[float | None] = field(default_factory=list)
 
 
 def pcg(
@@ -124,19 +168,31 @@ def pcg(
     """Preconditioned CG with true-residual checks before declaring convergence."""
     if rhs.ndim != 1 or rhs.numel() == 0:
         raise ValueError("PCG expects a nonempty vector")
+    if config.backend == "warp":
+        try:
+            from .warp_pcg import warp_pcg
+        except ModuleNotFoundError as error:
+            if error.name == "warp":
+                raise ImportError(
+                    "Warp PCG requires the optional dependency: pip install 'torchls[warp]'"
+                ) from error
+            raise
+
+        return warp_pcg(matvec, rhs, preconditioner=preconditioner, config=config)
     apply = (lambda x: x) if preconditioner is None else preconditioner
     x = torch.zeros_like(rhs)
     residual = rhs.clone()
     rhs_norm = float(torch.linalg.vector_norm(rhs))
     threshold = max(config.atol, config.rtol * rhs_norm)
     if not math.isfinite(rhs_norm):
-        return PCGResult(x, 0, rhs_norm, False, "nonfinite")
+        return PCGResult(x, 0, rhs_norm, False, "nonfinite", rhs_norm=rhs_norm)
     if rhs_norm <= threshold:
-        return PCGResult(x, 0, rhs_norm, True, "residual_tolerance")
+        return PCGResult(x, 0, rhs_norm, True, "residual_tolerance", rhs_norm=rhs_norm)
     z = apply(residual)
     rz = torch.dot(residual, z)
     direction = z.clone()
     iterations = 0
+    restarts = checks = 0
     reason = "max_iterations"
     for iterations in range(1, config.max_iterations + 1):
         product = matvec(direction)
@@ -151,27 +207,57 @@ def pcg(
         x = x + alpha * direction
         residual = residual - alpha * product
         recurrence_norm = float(torch.linalg.vector_norm(residual))
-        if recurrence_norm <= threshold or iterations % 50 == 0:
-            residual = rhs - matvec(x)
-            true_norm = float(torch.linalg.vector_norm(residual))
+        periodic_check = (
+            config.residual_check_interval > 0 and iterations % config.residual_check_interval == 0
+        )
+        if recurrence_norm <= threshold or periodic_check:
+            true_residual = rhs - matvec(x)
+            checks += 1
+            true_norm = float(torch.linalg.vector_norm(true_residual))
+            if not math.isfinite(true_norm):
+                return PCGResult(
+                    x, iterations, true_norm, False, "nonfinite", restarts, checks, rhs_norm
+                )
             if true_norm <= threshold:
-                return PCGResult(x, iterations, true_norm, True, "residual_tolerance")
-            # Restart after replacing the recurrence residual.
-            z = apply(residual)
-            rz = torch.dot(residual, z)
-            direction = z.clone()
-            continue
+                return PCGResult(
+                    x, iterations, true_norm, True, "residual_tolerance", restarts, checks, rhs_norm
+                )
+            drift = float(torch.linalg.vector_norm(true_residual - residual))
+            if (
+                recurrence_norm <= threshold
+                or config.restart_strategy == "periodic"
+                or drift > config.residual_drift_tolerance * max(true_norm, threshold)
+            ):
+                # Replace a drifting recurrence, but preserve conjugacy when
+                # the periodic true-residual check confirms it is reliable.
+                residual = true_residual
+                z = apply(residual)
+                rz = torch.dot(residual, z)
+                direction = z.clone()
+                restarts += 1
+                continue
         z = apply(residual)
         rz_new = torch.dot(residual, z)
         direction = z + (rz_new / rz) * direction
         rz = rz_new
     true_norm = float(torch.linalg.vector_norm(rhs - matvec(x)))
-    return PCGResult(x, iterations, true_norm, true_norm <= threshold, reason)
+    checks += 1
+    converged = math.isfinite(true_norm) and true_norm <= threshold
+    if converged:
+        reason = "residual_tolerance"
+    elif not math.isfinite(true_norm):
+        reason = "nonfinite"
+    return PCGResult(x, iterations, true_norm, converged, reason, restarts, checks, rhs_norm)
 
 
-def block_jacobi(jacobian: BlockJacobian, damping: float, *, diagonal=None):
+def block_jacobi(
+    jacobian: BlockJacobian, damping: float, *, diagonal=None, groups=(), graph_safe=False
+):
     """Factor damped variable diagonal blocks without building J.T J."""
     diagonal = jacobian.diagonal_blocks() if diagonal is None else diagonal
+    if groups:
+        plan = BlockJacobiPlan(jacobian.layout, groups, diagonal[0].device)
+        return plan.factor(plan.normal_blocks(jacobian, diagonal), damping, graph_safe=graph_safe)
     factors = tuple(
         torch.linalg.cholesky(
             block + damping * torch.eye(block.shape[-1], device=block.device, dtype=block.dtype)
@@ -184,7 +270,9 @@ def block_jacobi(jacobian: BlockJacobian, damping: float, *, diagonal=None):
         for entry, factor in zip(jacobian.layout, factors, strict=True):
             part = vector[entry.offset : entry.offset + entry.count * entry.dim]
             pieces.append(
-                torch.cholesky_solve(part.reshape(entry.count, entry.dim, 1), factor).reshape(-1)
+                cholesky_apply(
+                    part.reshape(entry.count, entry.dim, 1), factor, graph_safe=graph_safe
+                ).reshape(-1)
             )
         return torch.cat(pieces)
 
@@ -204,18 +292,33 @@ def solve(
     jacobi_scaling: bool = False,
     eliminate=None,
     profile: bool = False,
+    record_trials: bool = False,
+    bounds=None,
+    normal_blocks_backend: str = "auto",
 ):
     """Optimize with LM (or GN when trust_region=None).
 
     The first implementation is an eager Python solver. It returns detached
     estimates; differentiating through solve() is not part of this interface.
     The default path stores local Jacobians but never materializes J or J.T J.
+    normal_blocks_backend='auto' fuses diagonal-block accumulation on CUDA
+    float32/float64 when the Warp CG backend is selected; 'torch' forces the
+    reference implementation and 'warp' explicitly selects the fused path.
     """
     if linear_solver not in ("conjugate_gradient", "dense_qr", "schur_dense", "schur_cg"):
         raise ValueError("Unknown linear solver")
+    if normal_blocks_backend not in ("auto", "torch", "warp"):
+        raise ValueError("normal_blocks_backend must be auto, torch or warp")
     is_schur = linear_solver.startswith("schur_")
+    if conjugate_gradient.normal_matvec == "warp" and linear_solver != "conjugate_gradient":
+        raise ValueError("normal_matvec='warp' requires linear_solver='conjugate_gradient'")
     if eliminate is not None and not is_schur:
         raise ValueError("eliminate requires a Schur linear solver")
+    if conjugate_gradient.preconditioner_groups and linear_solver not in (
+        "conjugate_gradient",
+        "schur_cg",
+    ):
+        raise ValueError("Joint preconditioner groups require a CG linear solver")
     solve_start = time.perf_counter()
 
     def region(name):
@@ -228,6 +331,9 @@ def solve(
         )
 
     vals = initial_vals.detach()
+    bounds_plan = BoundsPlan(bounds, problem.layout, vals) if bounds is not None else None
+    if bounds_plan is not None and bounds_plan.groups and trust_region is None:
+        raise ValueError("Bounds require a trust-region LM solve")
     initial_cost = float(problem.cost(vals))
     if not math.isfinite(initial_cost):
         raise ValueError("Initial residuals are nonfinite")
@@ -241,10 +347,32 @@ def solve(
     damping = trust_region.lambda_initial if trust_region else 0.0
     rejection_factor = 2.0
     with region("analyze_schur"):
-        schur_plan = SchurPlan(problem, eliminate, vals.device) if is_schur else None
+        schur_plan = (
+            SchurPlan(
+                problem,
+                eliminate,
+                vals.device,
+                preconditioner_groups=conjugate_gradient.preconditioner_groups,
+            )
+            if is_schur
+            else None
+        )
+        joint_plan = (
+            BlockJacobiPlan(problem.layout, conjugate_gradient.preconditioner_groups, vals.device)
+            if not is_schur and conjugate_gradient.preconditioner_groups
+            else None
+        )
     if linear_solver == "schur_dense" and schur_plan.dim > 8192:
         raise ValueError("Dense Schur is limited to 8192 retained dimensions; use schur_cg")
     summary.reduced_dim = schur_plan.dim if is_schur else None
+    normal_plan = None
+    diagonal_plan = None
+    use_warp_diagonal = normal_blocks_backend == "warp" or (
+        normal_blocks_backend == "auto"
+        and conjugate_gradient.backend == "warp"
+        and vals.device.type == "cuda"
+        and vals.dtype in (torch.float32, torch.float64)
+    )
     column_scale = None
     with region("linearize"):
         linearization = problem.linearize(vals)
@@ -262,6 +390,10 @@ def solve(
             summary.termination_reason = "nonfinite_linearization"
             break
         gradient = linearization.gradient
+        if bounds_plan is not None:
+            free_mask = bounds_plan.free_mask(vals, gradient)
+            gradient = gradient * free_mask
+            jacobian = jacobian.scale_columns(free_mask)
         summary.gradient_norm = float(gradient.abs().max())
         if (
             termination.target_cost is not None
@@ -279,11 +411,16 @@ def solve(
                 linear_solver == "conjugate_gradient"
                 and conjugate_gradient.preconditioner is not None
             )
-            diagonal = (
-                jacobian.diagonal_blocks()
-                if needs_diagonal or diagonal_damping or (jacobi_scaling and column_scale is None)
-                else None
-            )
+            diagonal = None
+            if needs_diagonal or diagonal_damping or (jacobi_scaling and column_scale is None):
+                if use_warp_diagonal:
+                    from .warp_diagonal import WarpDiagonalPlan
+
+                    if diagonal_plan is None:
+                        diagonal_plan = WarpDiagonalPlan(jacobian)
+                    diagonal = diagonal_plan.diagonal_blocks(jacobian)
+                else:
+                    diagonal = jacobian.diagonal_blocks()
             if jacobi_scaling:
                 if column_scale is None:
                     # Same fixed-at-initialization convention as Ceres. Adding
@@ -329,11 +466,24 @@ def solve(
                 linear_gradient = gradient
             schur_linear = (
                 SchurLinearization(
-                    jacobian, diagonal, schur_plan, dense=linear_solver == "schur_dense"
+                    jacobian,
+                    diagonal,
+                    schur_plan,
+                    dense=linear_solver == "schur_dense",
+                    cache_retained=conjugate_gradient.cache_retained_matrix
+                    and linear_solver == "schur_cg",
                 )
                 if is_schur
                 else None
             )
+            joint_diagonal = joint_plan.normal_blocks(jacobian, diagonal) if joint_plan else None
+            normal_operator = jacobian
+            if linear_solver == "conjugate_gradient" and conjugate_gradient.normal_matvec == "warp":
+                from .warp_normal import WarpNormalPlan
+
+                if normal_plan is None:
+                    normal_plan = WarpNormalPlan(jacobian)
+                normal_operator = normal_plan.bind(jacobian)
         old_cost = float(linearization.cost)
         accepted = False
         trial_limit = trust_region.max_trials if trust_region else 1
@@ -360,11 +510,14 @@ def solve(
                             retained = torch.cholesky_solve(rhs[:, None], factor).reshape(-1)
                             iterations, converged = 1, True
                             usable = bool(torch.isfinite(retained).all())
+                            summary.linear_relative_residual_history.append(None)
                         else:
                             result = pcg(
                                 system.matvec,
                                 rhs,
-                                preconditioner=system.preconditioner()
+                                preconditioner=system.preconditioner(
+                                    graph_safe=conjugate_gradient.backend == "warp"
+                                )
                                 if conjugate_gradient.preconditioner
                                 else None,
                                 config=conjugate_gradient,
@@ -378,19 +531,39 @@ def solve(
                                 "residual_tolerance",
                                 "max_iterations",
                             ) and bool(torch.isfinite(retained).all())
+                            summary.linear_restarts += result.restarts
+                            summary.linear_residual_checks += result.residual_checks
+                            summary.linear_relative_residual_history.append(
+                                result.residual_norm / result.rhs_norm
+                                if result.rhs_norm
+                                else result.residual_norm
+                            )
                         delta = system.backsubstitute(retained)
                     summary.linear_iterations += iterations
                     summary.linear_iterations_history.append(iterations)
                     summary.linear_converged_history.append(converged)
                 else:
                     precondition = (
-                        block_jacobi(jacobian, damping, diagonal=diagonal)
+                        (
+                            joint_plan.factor(
+                                joint_diagonal,
+                                damping,
+                                graph_safe=conjugate_gradient.backend == "warp",
+                            )
+                            if joint_plan
+                            else block_jacobi(
+                                jacobian,
+                                damping,
+                                diagonal=diagonal,
+                                graph_safe=conjugate_gradient.backend == "warp",
+                            )
+                        )
                         if conjugate_gradient.preconditioner is not None
                         else None
                     )
                     with region("linear_solve"):
                         result = pcg(
-                            partial(jacobian.normal_matvec, damping=damping),
+                            partial(normal_operator.normal_matvec, damping=damping),
                             -linear_gradient,
                             preconditioner=precondition,
                             config=conjugate_gradient,
@@ -398,6 +571,13 @@ def solve(
                     summary.linear_iterations += result.iterations
                     summary.linear_iterations_history.append(result.iterations)
                     summary.linear_converged_history.append(result.converged)
+                    summary.linear_restarts += result.restarts
+                    summary.linear_residual_checks += result.residual_checks
+                    summary.linear_relative_residual_history.append(
+                        result.residual_norm / result.rhs_norm
+                        if result.rhs_norm
+                        else result.residual_norm
+                    )
                     delta = result.solution
                     # An inexact but finite iterate may still produce a valid LM step.
                     usable = result.reason in (
@@ -409,7 +589,10 @@ def solve(
             if usable:
                 if solve_scale is not None:
                     delta = solve_scale * delta
-                proposed = vals.retract(delta, problem.layout)
+                if bounds_plan is None:
+                    proposed = vals.retract(delta, problem.layout)
+                else:
+                    proposed, delta = bounds_plan.retract(vals, delta)
                 with region("trial_residual"):
                     objective, reduction = problem._evaluate_trial(proposed, linearization)
                 proposed_cost = float(objective)
@@ -425,6 +608,16 @@ def solve(
                     trust_region is None
                     or (actual > 0 and quality >= trust_region.step_quality_min)
                 )
+                if record_trials:
+                    summary.trial_history.append(
+                        dict(
+                            damping=damping,
+                            predicted_reduction=predicted,
+                            actual_reduction=actual,
+                            gain_ratio=quality,
+                            accepted=accepted,
+                        )
+                    )
                 if accepted:
                     vals = proposed
                     summary.accepted_steps += 1
@@ -451,7 +644,10 @@ def solve(
                     # when cost/step tolerances stop immediately after a step.
                     with region("linearize"):
                         linearization = problem.linearize(vals)
-                    summary.gradient_norm = float(linearization.gradient.abs().max())
+                    final_gradient = linearization.gradient
+                    if bounds_plan is not None:
+                        final_gradient = bounds_plan.projected_gradient(vals, final_gradient)
+                    summary.gradient_norm = float(final_gradient.abs().max())
                     if (
                         termination.target_cost is not None
                         and proposed_cost <= termination.target_cost

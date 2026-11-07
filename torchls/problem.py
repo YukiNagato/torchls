@@ -6,7 +6,9 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from .batching import AutoBatchSize
 from .cost import Cost
+from .linearization import make_linearizer
 from .sparse import BlockJacobian, JacobianGroup
 from .variables import Var, VariableLayout, VarValues, _ids, _NamedValues, _ParameterRef
 
@@ -73,6 +75,9 @@ class _CostPlan:
         self.type_indices = tuple(self.type_indices)
         self.indices = tuple(self.indices)
         self._device_cache = {}
+        self._batch_cache = {}
+        self._linearizer_cache = {}
+        self._mode_cache = {}
         # Validate measurement batch shapes during analysis, not inside AD.
         for i, arg in enumerate(cost.args):
             if _is_reference(arg):
@@ -92,6 +97,24 @@ class _CostPlan:
             return self.cost.in_dims[i]
         return 0 if self.batched and tensor.ndim > 0 else None
 
+    def batch_size(self, args, vals, layout):
+        policy = self.cost.batch_size
+        if not isinstance(policy, AutoBatchSize):
+            return policy
+        key = (policy, vals.device, vals.dtype)
+        if key not in self._batch_cache:
+            sample = self.cost.residual_fn(*(arg[0] for arg in args))
+            self._batch_cache[key] = policy.resolve(
+                count=self.count,
+                input_bytes=sum(arg[0].numel() * arg.element_size() for arg in args),
+                residual_dim=sample.numel(),
+                tangent_dim=sum(layout[t].dim for t in self.type_indices),
+                mode=self.cost.jac_mode,
+                itemsize=sample.element_size(),
+                device=vals.device,
+            )
+        return self._batch_cache[key]
+
     def device_indices(self, device, layout):
         if device not in self._device_cache:
             indices = tuple(index.to(device) for index in self.indices)
@@ -103,6 +126,28 @@ class _CostPlan:
             )
             self._device_cache[device] = indices, columns
         return self._device_cache[device]
+
+    def linearize(self, args, vals, layout, has_loss):
+        types = tuple(layout[t].var_type for t in self.type_indices)
+        batch = self.batch_size(args, vals, layout)
+        signature = (vals.device, vals.dtype, tuple((a.shape[1:], a.dtype) for a in args))
+        mode = self.cost.jac_mode
+        if mode == "auto" and self.cost.jacobian_fn is None:
+            if signature not in self._mode_cache:
+                sample = self.cost.residual_fn(*(a[0] for a in args))
+                self._mode_cache[signature] = (
+                    "reverse" if sample.numel() <= sum(t.tangent_dim for t in types) else "forward"
+                )
+            mode = self._mode_cache[signature]
+        key = (mode, has_loss, batch)
+        if key not in self._linearizer_cache:
+            self._linearizer_cache[key] = make_linearizer(
+                self.cost, self.slots, types, mode, batch, has_loss
+            )
+        function = self._linearizer_cache[key]
+        zeros = tuple(args[0].new_zeros(t.tangent_dim, dtype=vals.dtype) for t in types)
+        blocks, residual, raw, objective = function(zeros, *args)
+        return blocks, residual, raw, objective.sum() if objective is not None else None
 
     def gather(self, vals, layout):
         indices, columns = self.device_indices(vals.device, layout)
@@ -180,9 +225,9 @@ class AnalyzedLeastSquaresProblem:
         residuals = []
         for plan in self._plans:
             args, _, _ = plan.gather(vals, self.layout)
-            residual = torch.func.vmap(plan.cost.residual_fn, chunk_size=plan.cost.batch_size)(
-                *args
-            )
+            residual = torch.func.vmap(
+                plan.cost.residual_fn, chunk_size=plan.batch_size(args, vals, self.layout)
+            )(*args)
             residuals.append(residual.reshape(-1))
         return torch.cat(residuals)
 
@@ -193,9 +238,9 @@ class AnalyzedLeastSquaresProblem:
         values = []
         for plan in self._plans:
             args, _, _ = plan.gather(vals, self.layout)
-            residual = torch.func.vmap(plan.cost.residual_fn, chunk_size=plan.cost.batch_size)(
-                *args
-            ).reshape(plan.count, -1)
+            residual = torch.func.vmap(
+                plan.cost.residual_fn, chunk_size=plan.batch_size(args, vals, self.layout)
+            )(*args).reshape(plan.count, -1)
             squared = residual.to(torch.float64).square().sum(dim=-1)
             loss = plan.cost.loss
             values.append((squared if loss is None else loss.value(squared)).sum())
@@ -235,57 +280,12 @@ class AnalyzedLeastSquaresProblem:
         groups, residuals, raw_residuals, objectives = [], [], [], []
         for plan in self._plans:
             args, indices, columns = plan.gather(vals, self.layout)
-            cost = plan.cost
-            types = [self.layout[t].var_type for t in plan.type_indices]
-
-            def local_residual(
-                deltas,
-                *local_args,
-                _slots=plan.slots,
-                _types=types,
-                _fn=cost.residual_fn,
-            ):
-                updated = list(local_args)
-                for pos, key, delta in zip(_slots, _types, deltas, strict=True):
-                    updated[pos] = key.retract_fn(local_args[pos], delta)
-                residual = _fn(*updated).reshape(-1)
-                return residual, residual
-
-            if cost.jacobian_fn is None:
-                zeros = tuple(args[0].new_zeros(key.tangent_dim, dtype=vals.dtype) for key in types)
-                mode = cost.jac_mode
-                if mode == "auto":
-                    sample = cost.residual_fn(*(arg[0] for arg in args))
-                    mode = (
-                        "reverse"
-                        if sample.numel() <= sum(key.tangent_dim for key in types)
-                        else "forward"
-                    )
-                differentiate = torch.func.jacrev if mode == "reverse" else torch.func.jacfwd
-                jac_one = differentiate(local_residual, argnums=0, has_aux=True)
-                blocks, residual = torch.func.vmap(
-                    jac_one,
-                    in_dims=(None, *([0] * len(args))),
-                    chunk_size=cost.batch_size,
-                )(zeros, *args)
-            else:
-                blocks = torch.func.vmap(cost.jacobian_fn, chunk_size=cost.batch_size)(*args)
-                residual = torch.func.vmap(cost.residual_fn, chunk_size=cost.batch_size)(*args)
-                residual = residual.reshape(plan.count, -1)
-                if not isinstance(blocks, tuple) or len(blocks) != len(types):
-                    raise ValueError("Custom Jacobian must return one block per Var argument")
-            for block, key in zip(blocks, types, strict=True):
-                if block.shape != (plan.count, residual.shape[1], key.tangent_dim):
-                    raise ValueError("Incorrect local Jacobian shape")
+            blocks, residual, raw, objective = plan.linearize(
+                args, vals, self.layout, self._has_loss
+            )
             if self._has_loss:
-                raw_residuals.append(residual.reshape(-1))
-                squared = residual.to(torch.float64).square().sum(dim=-1)
-                if cost.loss is None:
-                    objectives.append(squared.sum())
-                else:
-                    evaluation = cost.loss.evaluate(squared)
-                    objectives.append(evaluation[0].sum())
-                    residual, blocks = cost.loss._linearize(residual, blocks, squared, evaluation)
+                raw_residuals.append(raw.reshape(-1))
+                objectives.append(objective)
             residuals.append(residual.reshape(-1))
             groups.append(JacobianGroup(tuple(blocks), columns, plan.type_indices, indices))
         residual = torch.cat(residuals)

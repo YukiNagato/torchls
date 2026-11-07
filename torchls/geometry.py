@@ -57,6 +57,56 @@ def se3_exp(tangent: Tensor) -> Tensor:
     return torch.cat((top, bottom), dim=-2)
 
 
+def sim3_exp(tangent: Tensor) -> Tensor:
+    """Sim(3) exponential to (..., 4, 4), with positive scale in the 3x3 block.
+
+    Tangent order: [translation(3), rotation(3), log_scale(1)]. Translation is
+    coupled to both rotation and scale through the matrix exponential, not a
+    direct copy of the tangent. Unlike SO(3)/SE(3), the finite Sim(3) update uses
+    torch.matrix_exp for stable behavior at zero rotation/scale and their limits.
+    Sim3Var linearization uses sim3_retract_jvp and does not differentiate Exp.
+    """
+    eye = torch.eye(3, dtype=tangent.dtype, device=tangent.device)
+    algebra = skew(tangent[..., 3:6]) + tangent[..., 6:7, None] * eye
+    top = torch.cat((algebra, tangent[..., :3, None]), dim=-1)
+    bottom = tangent.new_zeros((*tangent.shape[:-1], 1, 4))
+    return torch.matrix_exp(torch.cat((top, bottom), dim=-2))
+
+
+def so3_retract_jvp(rotation: Tensor, direction: Tensor) -> Tensor:
+    """D_delta (R @ Exp(delta)) at delta=0, applied to direction (..., 3)."""
+    return rotation @ skew(direction)
+
+
+def se3_retract_jvp(pose: Tensor, direction: Tensor) -> Tensor:
+    """Right SE(3) retraction derivative at zero; order [translation, rotation].
+
+    Returns the storage-space differential (..., 4, 4), not an updated pose.
+    """
+    rotation = pose[..., :3, :3]
+    top = torch.cat(
+        (so3_retract_jvp(rotation, direction[..., 3:6]), rotation @ direction[..., :3, None]),
+        dim=-1,
+    )
+    bottom = torch.zeros_like(top[..., :1, :])
+    return torch.cat((top, bottom), dim=-2)
+
+
+def sim3_retract_jvp(pose: Tensor, direction: Tensor) -> Tensor:
+    """Right Sim(3) retraction derivative at zero; order [translation, rotation, scale].
+
+    The last direction component is log-scale. The pose's 3x3 block stores sR.
+    Returns a (..., 4, 4) differential; supports broadcasting batch dimensions.
+    """
+    scaled_rotation = pose[..., :3, :3]
+    rotation_part = (
+        so3_retract_jvp(scaled_rotation, direction[..., 3:6])
+        + scaled_rotation * direction[..., 6:7, None]
+    )
+    top = torch.cat((rotation_part, scaled_rotation @ direction[..., :3, None]), dim=-1)
+    return torch.cat((top, torch.zeros_like(top[..., :1, :])), dim=-2)
+
+
 def _se2_retract(pose: Tensor, delta: Tensor) -> Tensor:
     angle = pose[2]
     dtheta = delta[2]
@@ -82,5 +132,29 @@ class SE3Var(
     default_factory=lambda: torch.eye(4),
     tangent_dim=6,
     retract_fn=lambda pose, delta: pose @ se3_exp(delta),
+    retract_jvp_fn=se3_retract_jvp,
 ):
-    """SE(3) poses stored as 4x4 matrices, updated on the right."""
+    """SE(3) 4x4 poses; right update with [translation(3), rotation(3)] tangent."""
+
+
+class SO3Var(
+    Var,
+    default_factory=lambda: torch.eye(3),
+    tangent_dim=3,
+    retract_fn=lambda rotation, delta: rotation @ so3_exp(delta),
+    retract_jvp_fn=so3_retract_jvp,
+):
+    """SO(3) 3x3 rotations; right update with a 3D axis-angle tangent."""
+
+
+class Sim3Var(
+    Var,
+    default_factory=lambda: torch.eye(4),
+    tangent_dim=7,
+    retract_fn=lambda pose, delta: pose @ sim3_exp(delta),
+    retract_jvp_fn=sim3_retract_jvp,
+):
+    """Sim(3) 4x4 poses storing [sR,t;0,1], s>0, updated on the right.
+
+    Tangent order: [translation(3), rotation(3), log_scale(1)].
+    """
