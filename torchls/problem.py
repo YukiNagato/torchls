@@ -8,7 +8,7 @@ from torch import Tensor
 
 from .batching import AutoBatchSize
 from .cost import Cost
-from .linearization import make_linearizer
+from .linearization import make_linearizer, stream_linearization
 from .sparse import BlockJacobian, JacobianGroup
 from .variables import Var, VariableLayout, VarValues, _ids, _NamedValues, _ParameterRef
 
@@ -115,6 +115,16 @@ class _CostPlan:
             )
         return self._batch_cache[key]
 
+    def resolved_batch_size(self, vals, layout):
+        policy = self.cost.batch_size
+        if not isinstance(policy, AutoBatchSize):
+            return policy
+        key = (policy, vals.device, vals.dtype)
+        if key not in self._batch_cache:
+            sample, _, _ = self.gather(vals, layout, 0, 1)
+            return self.batch_size(sample, vals, layout)
+        return self._batch_cache[key]
+
     def device_indices(self, device, layout):
         if device not in self._device_cache:
             indices = tuple(index.to(device) for index in self.indices)
@@ -127,7 +137,7 @@ class _CostPlan:
             self._device_cache[device] = indices, columns
         return self._device_cache[device]
 
-    def linearize(self, args, vals, layout, has_loss):
+    def linearize(self, args, vals, layout, has_loss, *, reduce_objective=True):
         types = tuple(layout[t].var_type for t in self.type_indices)
         batch = self.batch_size(args, vals, layout)
         signature = (vals.device, vals.dtype, tuple((a.shape[1:], a.dtype) for a in args))
@@ -147,27 +157,61 @@ class _CostPlan:
         function = self._linearizer_cache[key]
         zeros = tuple(args[0].new_zeros(t.tangent_dim, dtype=vals.dtype) for t in types)
         blocks, residual, raw, objective = function(zeros, *args)
+        return blocks, residual, raw, (objective.sum()
+            if objective is not None and reduce_objective else objective)
+
+    def linearize_values(self, vals, layout, has_loss):
+        batch = self.resolved_batch_size(vals, layout)
+        if batch is None or self.count <= batch:
+            args, _, _ = self.gather(vals, layout)
+            return self.linearize(args, vals, layout, has_loss)
+
+        def evaluate(start, end):
+            args, _, _ = self.gather(vals, layout, start, end)
+            return self.linearize(args, vals, layout, has_loss, reduce_objective=False)
+
+        blocks, residual, raw, objective = stream_linearization(evaluate, self.count, batch)
         return blocks, residual, raw, objective.sum() if objective is not None else None
 
-    def gather(self, vals, layout):
+    def gather(self, vals, layout, start=0, end=None):
         indices, columns = self.device_indices(vals.device, layout)
         args = []
         slot_index = 0
         for i, arg in enumerate(self.cost.args):
             if _is_reference(arg):
                 key = layout[self.type_indices[slot_index]].key
-                args.append(vals._values[key][indices[slot_index]])
+                args.append(vals._values[key][indices[slot_index][start:end]])
                 slot_index += 1
             else:
-                tensor = torch.as_tensor(arg, device=vals.device)
-                if tensor.is_floating_point():
+                tensor = torch.as_tensor(arg)
+                if tensor.is_floating_point() and not isinstance(arg, torch.Tensor):
                     # Convert Python numbers directly to the requested dtype;
                     # first rounding through the default float32 loses bits.
-                    tensor = torch.as_tensor(arg, device=vals.device, dtype=vals.dtype)
+                    tensor = torch.as_tensor(arg, dtype=vals.dtype)
                 if self._data_axis(i, tensor) is None:
                     tensor = tensor.unsqueeze(0)
-                args.append(tensor.expand(self.count, *tensor.shape[1:]))
+                tensor = tensor.expand(self.count, *tensor.shape[1:])[start:end]
+                args.append(tensor.to(device=vals.device,
+                    dtype=vals.dtype if tensor.is_floating_point() else tensor.dtype))
         return args, indices, columns
+
+    def residuals(self, vals, layout):
+        # Determine the batch size from one observation before gathering all
+        # poses/points. In BA these expanded inputs can exceed the Jacobian.
+        batch = self.resolved_batch_size(vals, layout)
+        evaluate = torch.func.vmap(self.cost.residual_fn)
+        if batch is None or self.count <= batch:
+            args, _, _ = self.gather(vals, layout)
+            return evaluate(*args)
+        for start in range(0, self.count, batch):
+            end = min(start + batch, self.count)
+            args, _, _ = self.gather(vals, layout, start, end)
+            values = evaluate(*args)
+            if start == 0:
+                output = values.new_empty((self.count, *values.shape[1:]))
+            output[start:end].copy_(values)
+            del args, values
+        return output
 
 
 class LeastSquaresProblem:
@@ -224,10 +268,7 @@ class AnalyzedLeastSquaresProblem:
         self._validate_values(vals)
         residuals = []
         for plan in self._plans:
-            args, _, _ = plan.gather(vals, self.layout)
-            residual = torch.func.vmap(
-                plan.cost.residual_fn, chunk_size=plan.batch_size(args, vals, self.layout)
-            )(*args)
+            residual = plan.residuals(vals, self.layout)
             residuals.append(residual.reshape(-1))
         return torch.cat(residuals)
 
@@ -237,10 +278,7 @@ class AnalyzedLeastSquaresProblem:
         self._validate_values(vals)
         values = []
         for plan in self._plans:
-            args, _, _ = plan.gather(vals, self.layout)
-            residual = torch.func.vmap(
-                plan.cost.residual_fn, chunk_size=plan.batch_size(args, vals, self.layout)
-            )(*args).reshape(plan.count, -1)
+            residual = plan.residuals(vals, self.layout).reshape(plan.count, -1)
             squared = residual.to(torch.float64).square().sum(dim=-1)
             loss = plan.cost.loss
             values.append((squared if loss is None else loss.value(squared)).sum())
@@ -262,27 +300,30 @@ class AnalyzedLeastSquaresProblem:
             old = before[offset : offset + count * rows].reshape(count, rows)
             new = proposed[offset : offset + count * rows].reshape(count, rows)
             offset += count * rows
-            old_squared, new_squared = old.square().sum(-1), new.square().sum(-1)
-            difference = ((old - new) * (old + new)).sum(-1)
             loss = plan.cost.loss
-            objectives.append((new_squared if loss is None else loss.value(new_squared)).sum())
-            reductions.append(
-                (
-                    difference
-                    if loss is None
-                    else loss._reduction(old_squared, new_squared, difference)
-                ).sum()
-            )
+            batch = plan.resolved_batch_size(vals, self.layout) or count
+            values = old.new_empty(count)
+            changes = old.new_empty(count)
+            for start in range(0, count, batch):
+                end = min(start + batch, count)
+                a, b = old[start:end], new[start:end]
+                old_squared, new_squared = a.square().sum(-1), b.square().sum(-1)
+                difference = ((a - b) * (a + b)).sum(-1)
+                values[start:end] = new_squared if loss is None else loss.value(new_squared)
+                changes[start:end] = (difference if loss is None
+                    else loss._reduction(old_squared, new_squared, difference))
+                del a, b, old_squared, new_squared, difference
+            objectives.append(values.sum())
+            reductions.append(changes.sum())
+            del values, changes
         return 0.5 * torch.stack(objectives).sum(), 0.5 * torch.stack(reductions).sum()
 
     def linearize(self, vals: VarValues) -> Linearization:
         self._validate_values(vals)
         groups, residuals, raw_residuals, objectives = [], [], [], []
         for plan in self._plans:
-            args, indices, columns = plan.gather(vals, self.layout)
-            blocks, residual, raw, objective = plan.linearize(
-                args, vals, self.layout, self._has_loss
-            )
+            indices, columns = plan.device_indices(vals.device, self.layout)
+            blocks, residual, raw, objective = plan.linearize_values(vals, self.layout, self._has_loss)
             if self._has_loss:
                 raw_residuals.append(raw.reshape(-1))
                 objectives.append(objective)

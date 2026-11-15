@@ -28,12 +28,18 @@ class ConjugateGradientConfig:
     residual_drift_tolerance: float = 0.1
     backend: str = "torch"
     normal_matvec: str = "torch"
+    # Cap the extra SoA Jacobian copy; larger Warp operators read existing blocks.
+    normal_max_packed_bytes: int = 256 * 1024**2
     # Warp: graph replays between host status reads; GPU guards freeze stopped iterates.
     graph_batch_iterations: int = 16
     # Schur-CG: cache B = J_retained.T @ J_retained as sparse CSR per linearization.
     cache_retained_matrix: bool = False
 
     def __post_init__(self):
+        if (isinstance(self.normal_max_packed_bytes, bool)
+                or not isinstance(self.normal_max_packed_bytes, int)
+                or self.normal_max_packed_bytes < 0):
+            raise ValueError("normal_max_packed_bytes must be a nonnegative integer")
         if (
             isinstance(self.graph_batch_iterations, bool)
             or not isinstance(self.graph_batch_iterations, int)
@@ -482,7 +488,9 @@ def solve(
                 from .warp_normal import WarpNormalPlan
 
                 if normal_plan is None:
-                    normal_plan = WarpNormalPlan(jacobian)
+                    normal_plan = WarpNormalPlan(
+                        jacobian, max_packed_bytes=conjugate_gradient.normal_max_packed_bytes
+                    )
                 normal_operator = normal_plan.bind(jacobian)
         old_cost = float(linearization.cost)
         accepted = False
@@ -598,7 +606,7 @@ def solve(
                 proposed_cost = float(objective)
                 predicted = float(
                     -torch.dot(gradient.double(), delta.double())
-                    - 0.5 * original_jacobian.matvec(delta).double().square().sum()
+                    - 0.5 * original_jacobian.squared_matvec_norm(delta)
                 )
                 # Compare the true objective, not the robust model's squared
                 # residual. Expanded differences preserve small improvements.
@@ -642,6 +650,11 @@ def solve(
                             )
                     # Keep the summary gradient at the returned solution, even
                     # when cost/step tolerances stop immediately after a step.
+                    # Accepted steps no longer need the old linear system.
+                    # Drop every owning view before allocating the next J.
+                    linearization = residual = jacobian = original_jacobian = None
+                    normal_operator = schur_linear = precondition = system = None
+                    diagonal = joint_diagonal = gradient = linear_gradient = None
                     with region("linearize"):
                         linearization = problem.linearize(vals)
                     final_gradient = linearization.gradient

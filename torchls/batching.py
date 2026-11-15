@@ -14,7 +14,8 @@ class AutoBatchSize:
 
     This is a heuristic, not a hard memory limit: arbitrary residual functions
     may create intermediates whose sizes cannot be inferred from their inputs.
-    Full gathered inputs and the returned Jacobian are outside this budget.
+    Gathered inputs are processed per chunk; the returned full Jacobian and
+    the solver's persistent buffers are outside this budget.
     Decrease the budget or specify an integer batch_size for such functions.
     None continues to mean an unchunked vmap, independently of this policy.
     """

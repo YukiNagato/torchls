@@ -9,10 +9,25 @@ residual functions are assumed.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Any
 
 import torch
 import warp as wp
+
+
+_work_streams = threading.local()
+
+
+def _work_stream(device):
+    # cuBLAS retains a workspace per CUDA stream. Repeated LM linear solves
+    # must not create a new stream (and another workspace) on every call.
+    streams = getattr(_work_streams, 'streams', None)
+    if streams is None:
+        streams = _work_streams.streams = {}
+    if device not in streams:
+        streams[device] = torch.cuda.Stream(device=device)
+    return streams[device]
 
 
 @wp.kernel
@@ -83,7 +98,7 @@ def warp_pcg(matvec, rhs, *, preconditioner, config):
         raise ValueError("Warp PCG requires CUDA float32 or float64 tensors")
     wp.init()
     caller = torch.cuda.current_stream(rhs.device)
-    stream = torch.cuda.Stream(device=rhs.device)
+    stream = _work_stream(rhs.device)
     stream.wait_stream(caller)
     with torch.cuda.stream(stream):
         result = _run(matvec, rhs, preconditioner=preconditioner, config=config)

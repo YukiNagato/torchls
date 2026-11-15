@@ -54,6 +54,32 @@ class BlockJacobian:
             offset += count * rows
         return out
 
+    def squared_matvec_norm(self, vector: Tensor, *, batch_size: int = 262144) -> Tensor:
+        """Return ||J v||² in float64 without materializing a large residual vector.
+
+        Sum slots before squaring, including when multiple slots alias a variable.
+        Chunking bounds the gathered tangent vectors and residual temporaries used
+        by LM's predicted reduction independently of the observation count.
+        """
+        if vector.shape != (self.shape[1],):
+            raise ValueError("matvec input has incorrect shape")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if sum(g.blocks[0].shape[0] for g in self.groups) <= batch_size:
+            return self.matvec(vector).double().square().sum()
+        total = vector.new_zeros((), dtype=torch.float64)
+        for group in self.groups:
+            for start in range(0, group.blocks[0].shape[0], batch_size):
+                local = None
+                for block, columns in zip(group.blocks, group.columns, strict=True):
+                    contribution = torch.einsum(
+                        "nrd,nd->nr", block[start:start + batch_size],
+                        vector[columns[start:start + batch_size]],
+                    )
+                    local = contribution if local is None else local + contribution
+                total = total + local.double().square().sum()
+        return total
+
     def normal_matvec(self, vector: Tensor, damping: float = 0.0) -> Tensor:
         return self.rmatvec(self.matvec(vector)) + damping * vector
 
