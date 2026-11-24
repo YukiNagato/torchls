@@ -20,6 +20,7 @@ class Cost:
     Variable IDs select observations. Tensor arguments default to a leading
     observation axis (a length-one axis broadcasts). Use in_dims=None for an
     argument shared by every observation, e.g. camera intrinsics.
+    Optional weights scale each observation's objective after applying its loss.
     """
 
     residual_fn: Callable[..., Tensor]
@@ -29,6 +30,7 @@ class Cost:
     in_dims: tuple[int | None, ...] | None = None
     jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None
     loss: Loss | None = None
+    weights: Tensor | float | None = None
 
     def __post_init__(self):
         if self.loss is not None and not isinstance(self.loss, Loss):

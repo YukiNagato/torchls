@@ -78,6 +78,16 @@ class _CostPlan:
         self._batch_cache = {}
         self._linearizer_cache = {}
         self._mode_cache = {}
+        self._weights = None
+        self._weight_cache = {}
+        if cost.weights is not None:
+            weights = torch.as_tensor(cost.weights)
+            if weights.ndim > 1 or weights.numel() not in (1, self.count) or weights.is_complex():
+                raise ValueError("Weights must be a real scalar or one value per observation")
+            weights = torch.as_tensor(cost.weights, dtype=torch.float64).detach()
+            if not (torch.isfinite(weights) & (weights >= 0)).all():
+                raise ValueError("Weights must be finite and nonnegative")
+            self._weights = weights.reshape(-1).clone()
         # Validate measurement batch shapes during analysis, not inside AD.
         for i, arg in enumerate(cost.args):
             if _is_reference(arg):
@@ -137,7 +147,14 @@ class _CostPlan:
             self._device_cache[device] = indices, columns
         return self._device_cache[device]
 
-    def linearize(self, args, vals, layout, has_loss, *, reduce_objective=True):
+    def observation_weights(self, device):
+        if self._weights is None:
+            return None
+        if device not in self._weight_cache:
+            self._weight_cache[device] = self._weights.to(device).expand(self.count)
+        return self._weight_cache[device]
+
+    def linearize(self, args, vals, layout, has_loss, *, weights=None, reduce_objective=True):
         types = tuple(layout[t].var_type for t in self.type_indices)
         batch = self.batch_size(args, vals, layout)
         signature = (vals.device, vals.dtype, tuple((a.shape[1:], a.dtype) for a in args))
@@ -157,18 +174,26 @@ class _CostPlan:
         function = self._linearizer_cache[key]
         zeros = tuple(args[0].new_zeros(t.tangent_dim, dtype=vals.dtype) for t in types)
         blocks, residual, raw, objective = function(zeros, *args)
+        if weights is not None:
+            scale = weights.sqrt().to(residual.dtype)
+            residual = residual * scale[:, None]
+            blocks = tuple(block * scale[:, None, None] for block in blocks)
+            objective = objective * weights
         return blocks, residual, raw, (objective.sum()
             if objective is not None and reduce_objective else objective)
 
     def linearize_values(self, vals, layout, has_loss):
         batch = self.resolved_batch_size(vals, layout)
+        weights = self.observation_weights(vals.device)
         if batch is None or self.count <= batch:
             args, _, _ = self.gather(vals, layout)
-            return self.linearize(args, vals, layout, has_loss)
+            return self.linearize(args, vals, layout, has_loss, weights=weights)
 
         def evaluate(start, end):
             args, _, _ = self.gather(vals, layout, start, end)
-            return self.linearize(args, vals, layout, has_loss, reduce_objective=False)
+            return self.linearize(args, vals, layout, has_loss,
+                                  weights=None if weights is None else weights[start:end],
+                                  reduce_objective=False)
 
         blocks, residual, raw, objective = stream_linearization(evaluate, self.count, batch)
         return blocks, residual, raw, objective.sum() if objective is not None else None
@@ -241,7 +266,8 @@ class AnalyzedLeastSquaresProblem:
         self.layout = layout
         self.tangent_dim = tangent_dim
         self._plans = tuple(_CostPlan(cost, layout) for cost in costs)
-        self._has_loss = any(plan.cost.loss is not None for plan in self._plans)
+        self._has_loss = any(plan.cost.loss is not None or plan.cost.weights is not None
+                             for plan in self._plans)
 
     def _validate_values(self, vals):
         if set(vals._values) != {entry.key for entry in self.layout}:
@@ -281,7 +307,9 @@ class AnalyzedLeastSquaresProblem:
             residual = plan.residuals(vals, self.layout).reshape(plan.count, -1)
             squared = residual.to(torch.float64).square().sum(dim=-1)
             loss = plan.cost.loss
-            values.append((squared if loss is None else loss.value(squared)).sum())
+            value = squared if loss is None else loss.value(squared)
+            weights = plan.observation_weights(vals.device)
+            values.append(value.sum() if weights is None else (weights * value).sum())
         return 0.5 * torch.stack(values).sum()
 
     def _evaluate_trial(self, vals, linearization):
@@ -313,8 +341,9 @@ class AnalyzedLeastSquaresProblem:
                 changes[start:end] = (difference if loss is None
                     else loss._reduction(old_squared, new_squared, difference))
                 del a, b, old_squared, new_squared, difference
-            objectives.append(values.sum())
-            reductions.append(changes.sum())
+            weights = plan.observation_weights(vals.device)
+            objectives.append(values.sum() if weights is None else (weights * values).sum())
+            reductions.append(changes.sum() if weights is None else (weights * changes).sum())
             del values, changes
         return 0.5 * torch.stack(objectives).sum(), 0.5 * torch.stack(reductions).sum()
 

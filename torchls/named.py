@@ -56,6 +56,7 @@ class Problem:
         in_dims: tuple[int | None, ...] | None = None,
         jacobian_fn: Callable[..., tuple[Tensor, ...]] | None = None,
         loss: Loss | None = None,
+        weights: Tensor | float | None = None,
     ) -> Problem:
         """Add a batch using an ordinary, undecorated residual function.
 
@@ -65,6 +66,7 @@ class Problem:
         exactly as in Cost. Indices are copied when the batch is added.
         ``loss`` applies to each observation's complete residual block;
         residual_fn and jacobian_fn return raw, unweighted values.
+        ``weights`` scales that loss and accepts a nonnegative scalar or one value per observation.
         batch_size accepts a positive integer, AutoBatchSize, or None (unchunked).
         """
         if not callable(residual_fn):
@@ -76,7 +78,7 @@ class Problem:
             for arg in args
         )
         self._costs.append(
-            Cost(residual_fn, bound, jac_mode, batch_size, in_dims, jacobian_fn, loss)
+            Cost(residual_fn, bound, jac_mode, batch_size, in_dims, jacobian_fn, loss, weights)
         )
         self._analyzed = None
         return self
